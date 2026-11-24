@@ -186,14 +186,19 @@ pub(crate) fn resync_title_writes() {
             }
             let from = (p as u64 * page).max(start);
             let to = ((p as u64 + 1) * page).min(end);
-            for i in (from - start) / step..(to - start).div_ceil(step) {
-                let i = i as u32;
-                if i < heap.desc.count {
-                    host.mirror(i, start + u64::from(i) * step, false);
-                }
+            let count = heap.desc.count.min(host.count());
+            for i in mirrored_slots(from - start, to - start, step, count) {
+                host.mirror(i as u32, start + i * step, false);
             }
         }
     }
+}
+
+/// Slots touched by a dirty byte range, clipped to what the host heap mirrors.
+#[cfg(any(windows, test))]
+fn mirrored_slots(from: u64, to: u64, step: u64, count: u32) -> std::ops::Range<u64> {
+    let count = u64::from(count);
+    (from / step).min(count)..to.div_ceil(step).min(count)
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -718,6 +723,18 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resync_clips_dirty_ranges_to_the_mirrored_slots() {
+        let step = 32;
+        let cap = 737_856;
+        let end = u64::from(cap) * step;
+        assert_eq!(super::mirrored_slots(31, 33, step, cap), 0..2);
+        assert_eq!(super::mirrored_slots(end - 1, end + 64, step, cap), 737_855..737_856);
+        assert!(super::mirrored_slots(end + 32, end + 96, step, cap).is_empty());
+        assert_eq!(super::mirrored_slots(0, 1_245_184 * step, step, cap).count(), cap as usize);
+        assert!(super::mirrored_slots(0, 256, step, 0).is_empty());
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 

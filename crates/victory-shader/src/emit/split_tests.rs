@@ -1100,3 +1100,89 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
 }
+
+/// A 64-lane group filters lanes through two nested EXEC branches, writes the
+/// smallest surviving element ID and a mask of participating halves to LDS,
+/// then reads both words with EXEC restored. The two groups use distinct IDs.
+#[test]
+fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
+    let Ok(mut names) = adapters() else { return };
+    // Host::on chooses by name; repeated DXGI descriptions open the same device.
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let Ok(host) = Host::on(&name) else { continue };
+        if !host.target().runs(32) && !host.target().runs(64) {
+            continue;
+        }
+        // The outer mask is lane < end, the inner mask is lane >= start.
+        for (start, end) in [
+            (0u32, 0u32),
+            (8, 9),
+            (40, 41),
+            (31, 33),
+            (0, 64),
+            (40, 32),
+            (63, 64),
+            (32, 32),
+        ] {
+            let body = [
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E0A_02FF,
+                0x0000_00FF, // v_mov_b32 v5, 0xff
+                0x7E0C_0280, // v_mov_b32 v6, 0
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF88_0002, // s_cbranch_execz init_done
+                0xD838_0100,
+                0x0006_0501, // ds_write2_b32 v1, v5, v6 offset1:1
+                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBF8A_0000, // s_barrier
+                0x8F0E_8601, // s_lshl_b32 s14, s1, 6
+                0x4A0E_000E, // v_add_nc_u32 v7, s14, v0
+                0x7E0A_0281, // v_mov_b32 v5, 1
+                0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+                0x020C_0A82, // v_cndmask_b32 v6, 2, v5, vcc
+                0x7D88_0080 | end, // v_cmp_gt_u32 vcc, end, v0
+                0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+                0xBF88_0008, // s_cbranch_execz outer_done
+                0x7D86_0080 | start, // v_cmp_le_u32 vcc, start, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz inner_done
+                0xD81C_0000,
+                0x0000_0701, // ds_min_u32 v1, v7
+                0xD828_0004,
+                0x0000_0601, // ds_or_b32 v1, v6 offset:4
+                0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+                0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBF8A_0000, // s_barrier
+                0xD8DC_0100,
+                0x0400_0001, // ds_read2_b32 v[4:5], v1 offset1:1
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+                0x3804_0905, // v_or_b32 v2, v5, v4
+            ];
+            let values = run(&host, &program_lds(&body, 64), 2)
+                .unwrap_or_else(|e| panic!("{name}, [{start}, {end}): {e}"));
+            assert_eq!(values.len(), 128);
+            for (group, lanes) in values.chunks_exact(64).enumerate() {
+                let mut first = 255;
+                let mut halves = 0;
+                for lane in start..end {
+                    first = first.min(group as u32 * 64 + lane);
+                    halves |= 1 << (lane / 32);
+                }
+                let want = (first << 2) | halves;
+                for (lane, actual) in lanes.iter().enumerate() {
+                    assert_eq!(
+                        *actual, want,
+                        "{name}, [{start}, {end}), group {group}, lane {lane}"
+                    );
+                }
+            }
+            eprintln!("{name}: [{start}, {end}) matched 128 lane results");
+        }
+    }
+}
